@@ -343,6 +343,10 @@ static int32_t XNAToGL_TextureFormat[] =
 	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Dxt5SrgbEXT */
 	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Bc7EXT */
 	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Bc7SrgbEXT */
+
+	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Rgb8Etc2 */
+	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Rgb8A1Etc2 */
+	GL_COMPRESSED_TEXTURE_FORMATS,	/* SurfaceFormat.Rgba8Etc2 */
 };
 
 static int32_t XNAToGL_TextureInternalFormat[] =
@@ -372,6 +376,10 @@ static int32_t XNAToGL_TextureInternalFormat[] =
 	GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT,	/* SurfaceFormat.Dxt5SrgbEXT */
 	GL_COMPRESSED_RGBA_BPTC_UNORM_EXT,	/* SurfaceFormat.BC7EXT */
 	GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,/* SurfaceFormat.BC7SrgbEXT */
+
+	GL_COMPRESSED_RGB8_ETC2,		/* SurfaceFormat.Rgb8Etc2 */
+	GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,	/* SurfaceFormat.Rgb8A1Etc2 */
+	GL_COMPRESSED_RGBA8_ETC2_EAC,		/* SurfaceFormat.Rgba8Etc2 */
 };
 
 static int32_t XNAToGL_TextureDataType[] =

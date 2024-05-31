@@ -1,6 +1,6 @@
 /* FNA3D - 3D Graphics Library for FNA
  *
- * Copyright (c) 2020-2024 Ethan Lee
+ * Copyright (c) 2020-2023 Ethan Lee
  *
  * This software is provided 'as-is', without any express or implied warranty.
  * In no event will the authors be held liable for any damages arising from
@@ -49,7 +49,12 @@
 #define DXGI_DLL	"libdxvk_dxgi.so"
 #endif
 
+#ifdef __WINRT__
+#include <dxgi1_2.h>
+#include <d3dcompiler.h>
+#else
 #include <dxgi.h>
+#endif
 
 #ifndef DXGI_PRESENT_ALLOW_TEARING
 #define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
@@ -197,7 +202,6 @@ typedef struct D3D11SwapchainData
 	IDXGISwapChain *swapchain;
 	ID3D11RenderTargetView *swapchainRTView;
 	void *windowHandle;
-	FNA3D_SurfaceFormat format;
 } D3D11SwapchainData;
 
 #define WINDOW_SWAPCHAIN_DATA "FNA3D_D3D11Swapchain"
@@ -240,6 +244,10 @@ typedef struct D3D11Renderer /* Cast FNA3D_Renderer* to this! */
 
 	/* Capabilities */
 	uint8_t debugMode;
+	uint32_t supportsDxt1;
+	uint32_t supportsS3tc;
+	uint32_t supportsBc7;
+	uint8_t supportsSRGBRenderTarget;
 	int32_t maxMultiSampleCount;
 	D3D_FEATURE_LEVEL featureLevel;
 
@@ -1001,17 +1009,6 @@ static ID3D11InputLayout* D3D11_INTERNAL_FetchBindingsInputLayout(
 /* Forward Declarations */
 
 static void D3D11_INTERNAL_DisposeBackbuffer(D3D11Renderer *renderer);
-static void D3D11_INTERNAL_CreateSwapChain(
-       D3D11Renderer *renderer,
-       FNA3D_SurfaceFormat backBufferFormat,
-       void *windowHandle,
-       D3D11SwapchainData *swapchainData
-);
-static void D3D11_INTERNAL_UpdateSwapchainRT(
-	D3D11Renderer *renderer,
-	D3D11SwapchainData *swapchainData,
-	DXGI_FORMAT format
-);
 
 static void D3D11_SetRenderTargets(
 	FNA3D_Renderer *driverData,
@@ -1031,6 +1028,35 @@ static void D3D11_GetTextureData2D(
 	int32_t level,
 	void* data,
 	int32_t dataLength
+);
+
+static void* D3D11_PLATFORM_LoadD3D11();
+static void D3D11_PLATFORM_UnloadD3D11(void* module);
+static PFN_D3D11_CREATE_DEVICE D3D11_PLATFORM_GetCreateDeviceFunc(void* module);
+
+static HRESULT D3D11_PLATFORM_CreateDXGIFactory(
+	void** module,
+	void** factory
+);
+static void D3D11_PLATFORM_UnloadDXGI(void* module);
+static void D3D11_PLATFORM_GetDefaultAdapter(
+	void* factory,
+	IDXGIAdapter1 **adapter
+);
+
+static void D3D11_PLATFORM_CreateSwapChain(
+	D3D11Renderer *renderer,
+	FNA3D_SurfaceFormat backBufferFormat,
+	void* windowHandle
+);
+static HRESULT D3D11_PLATFORM_ResizeSwapChain(
+	D3D11Renderer *renderer,
+	D3D11SwapchainData *swapchain
+);
+static void D3D11_INTERNAL_UpdateSwapchainRT(
+	D3D11Renderer *renderer,
+	D3D11SwapchainData *swapchainData,
+	DXGI_FORMAT format
 );
 
 /* Renderer Implementation */
@@ -1142,8 +1168,8 @@ static void D3D11_DestroyDevice(FNA3D_Device *device)
 	ID3D11Device_Release(renderer->device);
 
 	/* Release the DLLs */
-	SDL_UnloadObject(renderer->d3d11_dll);
-	SDL_UnloadObject(renderer->dxgi_dll);
+	D3D11_PLATFORM_UnloadD3D11(renderer->d3d11_dll);
+	D3D11_PLATFORM_UnloadDXGI(renderer->dxgi_dll);
 
 	SDL_DestroyMutex(renderer->ctxLock);
 	SDL_free(renderer);
@@ -1538,11 +1564,10 @@ static void D3D11_SwapBuffers(
 	);
 	if (swapchainData == NULL)
 	{
-		D3D11_INTERNAL_CreateSwapChain(
+		D3D11_PLATFORM_CreateSwapChain(
 			renderer,
 			FNA3D_SURFACEFORMAT_COLOR, /* FIXME: Is there something we can use here? */
-			(SDL_Window*) overrideWindowHandle,
-			NULL
+			(SDL_Window*) overrideWindowHandle
 		);
 		swapchainData = (D3D11SwapchainData*) SDL_GetWindowData(
 			(SDL_Window*) overrideWindowHandle,
@@ -2525,173 +2550,6 @@ static void D3D11_ResolveTarget(
 
 /* Backbuffer Functions */
 
-static void D3D11_INTERNAL_CreateSwapChain(
-	D3D11Renderer *renderer,
-	FNA3D_SurfaceFormat backBufferFormat,
-	void *windowHandle,
-	D3D11SwapchainData *swapchainData
-) {
-	IDXGIFactory1* pParent;
-	DXGI_SWAP_CHAIN_DESC swapchainDesc;
-	IDXGISwapChain *swapchain;
-	HWND dxgiHandle;
-	void* factory4;
-	IDXGISwapChain3 *swapchain3;
-	DXGI_COLOR_SPACE_TYPE colorSpace;
-	HRESULT res;
-
-	uint8_t growSwapchains = (swapchainData == NULL);
-
-#ifdef FNA3D_DXVK_NATIVE
-	dxgiHandle = (HWND) windowHandle;
-#else
-	SDL_SysWMinfo info;
-	SDL_VERSION(&info.version);
-	SDL_GetWindowWMInfo((SDL_Window*) windowHandle, &info);
-	dxgiHandle = info.info.win.window;
-#endif /* FNA3D_DXVK_NATIVE */
-
-	/* Initialize swapchain buffer descriptor */
-	swapchainDesc.BufferDesc.Width = 0;
-	swapchainDesc.BufferDesc.Height = 0;
-	swapchainDesc.BufferDesc.RefreshRate.Numerator = 0;
-	swapchainDesc.BufferDesc.RefreshRate.Denominator = 0;
-	swapchainDesc.BufferDesc.Format = XNAToD3D_TextureFormat[backBufferFormat];
-	swapchainDesc.BufferDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
-	swapchainDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
-
-	/* Initialize the swapchain descriptor */
-	swapchainDesc.SampleDesc.Count = 1;
-	swapchainDesc.SampleDesc.Quality = 0;
-	swapchainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	swapchainDesc.BufferCount = 3;
-	swapchainDesc.OutputWindow = dxgiHandle;
-	swapchainDesc.Windowed = 1;
-	if (renderer->supportsTearing)
-	{
-		/* This enum may not be complete, so use the magic number */
-		swapchainDesc.Flags = 2048; /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; */
-
-		/* To support tearing we needed DXGI 1.5, so this is always available */
-		swapchainDesc.SwapEffect = (DXGI_SWAP_EFFECT) 4; /* DXGI_SWAP_EFFECT_FLIP_DISCARD */
-	}
-	else
-	{
-		swapchainDesc.Flags = 0;
-
-		/* For Windows 10+, use a better form of discard swap behavior */
-		if (!SDL_GetHintBoolean(
-			"FNA3D_D3D11_FORCE_BITBLT",
-			SDL_FALSE
-		) && SUCCEEDED(IDXGIFactory1_QueryInterface(
-			(IDXGIFactory1*) renderer->factory,
-			&D3D_IID_IDXGIFactory4,
-			(void**) &factory4
-		))) {
-			/* This enum may not be complete, so use the magic number */
-			swapchainDesc.SwapEffect = (DXGI_SWAP_EFFECT) 4; /* DXGI_SWAP_EFFECT_FLIP_DISCARD */
-			IDXGIFactory4_Release((IDXGIFactory4*) factory4);
-		}
-		else
-		{
-			swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-		}
-	}
-
-	/* Create the swapchain! */
-	res = IDXGIFactory1_CreateSwapChain(
-		(IDXGIFactory1*) renderer->factory,
-		(IUnknown*) renderer->device,
-		&swapchainDesc,
-		&swapchain
-	);
-	ERROR_CHECK("Could not create swapchain")
-
-	/*
-	 * The swapchain's parent is a separate factory from the factory that
-	 * we used to create the swapchain, and only that parent can be used to
-	 * set the window association. Trying to set an association on our factory
-	 * will silently fail and doesn't even verify arguments or return errors.
-	 * See https://gamedev.net/forums/topic/634235-dxgidisabling-altenter/4999955/
-	 */
-	res = IDXGISwapChain_GetParent(
-		swapchain,
-		&D3D_IID_IDXGIFactory1,
-		(void**) &pParent
-	);
-	if (FAILED(res))
-	{
-		FNA3D_LogWarn(
-			"Could not get swapchain parent! Error Code: %08X",
-			res
-		);
-	}
-	else
-	{
-		/* Disable DXGI window crap */
-		res = IDXGIFactory1_MakeWindowAssociation(
-			pParent,
-			dxgiHandle,
-			DXGI_MWA_NO_WINDOW_CHANGES
-		);
-		if (FAILED(res))
-		{
-			FNA3D_LogWarn(
-				"MakeWindowAssociation failed! Error Code: %08X",
-				res
-			);
-		}
-	}
-
-	/* Set colorspace, if applicable */
-	if (SDL_GetHintBoolean("FNA3D_ENABLE_HDR_COLORSPACE", SDL_FALSE))
-	{
-		if (SUCCEEDED(IDXGISwapChain_QueryInterface(
-			swapchain,
-			&D3D_IID_IDXGISwapChain3,
-			(void**) &swapchain3
-		))) {
-			if (backBufferFormat == FNA3D_SURFACEFORMAT_RGBA1010102)
-			{
-				colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-			}
-			else if (	backBufferFormat == FNA3D_SURFACEFORMAT_HALFVECTOR4 ||
-					backBufferFormat == FNA3D_SURFACEFORMAT_HDRBLENDABLE	)
-			{
-				colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-			}
-			else
-			{
-				colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-			}
-			IDXGISwapChain3_SetColorSpace1(swapchain3, colorSpace);
-		}
-	}
-
-	if (growSwapchains)
-	{
-		swapchainData = (D3D11SwapchainData*) SDL_malloc(sizeof(D3D11SwapchainData));
-	}
-	swapchainData->swapchain = swapchain;
-	swapchainData->windowHandle = windowHandle;
-	swapchainData->swapchainRTView = NULL;
-	swapchainData->format = backBufferFormat;
-	SDL_SetWindowData((SDL_Window*) windowHandle, WINDOW_SWAPCHAIN_DATA, swapchainData);
-	if (growSwapchains)
-	{
-		if (renderer->swapchainDataCount >= renderer->swapchainDataCapacity)
-		{
-			renderer->swapchainDataCapacity *= 2;
-			renderer->swapchainDatas = SDL_realloc(
-				renderer->swapchainDatas,
-				renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*)
-			);
-		}
-		renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
-		renderer->swapchainDataCount += 1;
-	}
-}
-
 static void D3D11_INTERNAL_UpdateSwapchainRT(
 	D3D11Renderer *renderer,
 	D3D11SwapchainData *swapchainData,
@@ -2702,7 +2560,9 @@ static void D3D11_INTERNAL_UpdateSwapchainRT(
 	D3D11_RENDER_TARGET_VIEW_DESC swapchainViewDesc;
 
 	/* Create a render target view for the swapchain */
-	swapchainViewDesc.Format = format;
+	swapchainViewDesc.Format = (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+		? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+		: DXGI_FORMAT_R8G8B8A8_UNORM;
 	swapchainViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
 	swapchainViewDesc.Texture2D.MipSlice = 0;
 
@@ -2739,33 +2599,20 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 	D3D11_TEXTURE2D_DESC depthStencilDesc;
 	D3D11_DEPTH_STENCIL_VIEW_DESC depthStencilViewDesc;
 	D3D11SwapchainData *swapchainData;
-	uint32_t support;
+	FNA3D_SurfaceFormat actualFnaFormat = parameters->backBufferFormat;
+	DXGI_FORMAT actualDxgiFormat = XNAToD3D_TextureFormat[actualFnaFormat];
 
-	DXGI_FORMAT dxgiFormat = XNAToD3D_TextureFormat[parameters->backBufferFormat];
+	if ((actualDxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) && !renderer->supportsSRGBRenderTarget)
+	{
+		FNA3D_LogWarn("Could not create an SRGB swapchain because this renderer does not support it. Silently falling back to UNORM.");
+		actualFnaFormat = FNA3D_SURFACEFORMAT_COLOR;
+		actualDxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
 
 	/* Dispose of the existing backbuffer in preparation for the new one. */
 	if (renderer->backbuffer != NULL)
 	{
 		D3D11_INTERNAL_DisposeBackbuffer(renderer);
-	}
-
-	/* FIXME: WineD3D does not expose D3D11_FORMAT_SUPPORT_DISPLAY,
-	 * Remove this when it has been added (and backported to 9.0?).
-	 */
-	if (parameters->backBufferFormat != FNA3D_SURFACEFORMAT_COLOR)
-	{
-		/* Check for valid rendering support */
-		ID3D11Device_CheckFormatSupport(
-			renderer->device,
-			dxgiFormat,
-			&support
-		);
-
-		if (!((support & D3D11_FORMAT_SUPPORT_DISPLAY)))
-		{
-			FNA3D_LogError("Unsupported backbuffer DXGI format");
-			return;
-		}
 	}
 
 	/* Create or update the swapchain */
@@ -2777,11 +2624,10 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		);
 		if (swapchainData == NULL)
 		{
-			D3D11_INTERNAL_CreateSwapChain(
+			D3D11_PLATFORM_CreateSwapChain(
 				renderer,
-				parameters->backBufferFormat,
-				parameters->deviceWindowHandle,
-				NULL
+				actualFnaFormat,
+				parameters->deviceWindowHandle
 			);
 			swapchainData = (D3D11SwapchainData*) SDL_GetWindowData(
 				(SDL_Window*) parameters->deviceWindowHandle,
@@ -2790,51 +2636,10 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		}
 		else
 		{
+			/* Resize the swapchain to the new window size */
 			ID3D11RenderTargetView_Release(swapchainData->swapchainRTView);
-			if (swapchainData->format != parameters->backBufferFormat)
-			{
-				/* Surface format changed, recreate entirely */
-				IDXGISwapChain_Release(swapchainData->swapchain);
-
-				/* 
-				 * DXGI will crash in some cases if we don't flush deferred swapchain destruction:
-				 *
-				 * DXGI ERROR: IDXGIFactory::CreateSwapChain: Only one flip model swap chain can be
-				 * associate with an HWND, IWindow, or composition surface at a time. ClearState()
-				 * and Flush() may need to be called on the D3D11 device context to trigger deferred
-				 * destruction of old swapchains. [ MISCELLANEOUS ERROR #297: ]
-				 *
-				 * -kg
-				 */
-				ID3D11DeviceContext_ClearState(renderer->context);
-				ID3D11DeviceContext_Flush(renderer->context);
-
-				/* Purge shadow state. This sucks. -kg */
-				renderer->topology = -1;
-				renderer->indexBuffer = NULL;
-				memset(&renderer->viewport, 0, sizeof(FNA3D_Viewport));
-				memset(&renderer->scissorRect, 0, sizeof(FNA3D_Rect));
-
-				D3D11_INTERNAL_CreateSwapChain(
-					renderer,
-					parameters->backBufferFormat,
-					parameters->deviceWindowHandle,
-					swapchainData
-				);
-			}
-			else
-			{
-				/* Resize the existing swapchain to the new window size */
-				res = IDXGISwapChain_ResizeBuffers(
-					swapchainData->swapchain,
-					0,			/* keep # of buffers the same */
-					0,			/* get width from window */
-					0,			/* get height from window */
-					DXGI_FORMAT_UNKNOWN,	/* keep the old format */
-					renderer->supportsTearing ? 2048 : 0 /* See INTERNAL_CreateSwapChain */
-				);
-				ERROR_CHECK_RETURN("Could not resize swapchain",)
-			}
+			res = D3D11_PLATFORM_ResizeSwapChain(renderer, swapchainData);
+			ERROR_CHECK_RETURN("Could not resize swapchain",)
 		}
 		useFauxBackbuffer = renderer->swapchainDataCount > 1;
 	}
@@ -2880,7 +2685,7 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		renderer->backbufferSizeChanged = 1;
 		renderer->backbuffer->width = parameters->backBufferWidth;
 		renderer->backbuffer->height = parameters->backBufferHeight;
-		renderer->backbuffer->d3d11.surfaceFormat = parameters->backBufferFormat;
+		renderer->backbuffer->d3d11.surfaceFormat = actualFnaFormat;
 		renderer->backbuffer->depthFormat = parameters->depthStencilFormat;
 		renderer->backbuffer->multiSampleCount = parameters->multiSampleCount;
 
@@ -2889,7 +2694,7 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		colorBufferDesc.Height = renderer->backbuffer->height;
 		colorBufferDesc.MipLevels = 1;
 		colorBufferDesc.ArraySize = 1;
-		colorBufferDesc.Format = dxgiFormat;
+		colorBufferDesc.Format = actualDxgiFormat;
 		colorBufferDesc.SampleDesc.Count = (
 			renderer->backbuffer->multiSampleCount > 1 ?
 				renderer->backbuffer->multiSampleCount :
@@ -2938,7 +2743,7 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 			colorBufferDesc.Height = renderer->backbuffer->height;
 			colorBufferDesc.MipLevels = 1;
 			colorBufferDesc.ArraySize = 1;
-			colorBufferDesc.Format = dxgiFormat;
+			colorBufferDesc.Format = actualDxgiFormat;
 			colorBufferDesc.SampleDesc.Count = 1;
 			colorBufferDesc.SampleDesc.Quality = 0;
 			colorBufferDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -2990,7 +2795,7 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		renderer->backbuffer->width = parameters->backBufferWidth;
 		renderer->backbuffer->height = parameters->backBufferHeight;
 		renderer->backbuffer->depthFormat = parameters->depthStencilFormat;
-		renderer->backbuffer->d3d11.surfaceFormat = parameters->backBufferFormat;
+		renderer->backbuffer->d3d11.surfaceFormat = actualFnaFormat;
 		renderer->backbuffer->multiSampleCount = 0;
 	}
 
@@ -3047,7 +2852,7 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		D3D11_INTERNAL_UpdateSwapchainRT(
 			renderer,
 			swapchainData,
-			dxgiFormat
+			actualDxgiFormat
 		);
 	}
 
@@ -3202,7 +3007,7 @@ static void D3D11_ReadBackbuffer(
 		ERROR_CHECK_RETURN("Could not get buffer from swapchain", )
 
 		backbufferTexture.handle = (ID3D11Resource*) swapchainBuffer;
-		backbufferTexture.format = renderer->swapchainDatas[0]->format;
+		backbufferTexture.format = FNA3D_SURFACEFORMAT_COLOR;
 	}
 
 	D3D11_GetTextureData2D(
@@ -3238,15 +3043,8 @@ static void D3D11_GetBackbufferSize(
 static FNA3D_SurfaceFormat D3D11_GetBackbufferSurfaceFormat(
 	FNA3D_Renderer *driverData
 ) {
-	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
-
-	if (renderer->backbuffer->type == BACKBUFFER_TYPE_D3D11)
-	{
-		return renderer->backbuffer->d3d11.surfaceFormat;
-	}
-
-	/* This path is only possible with a single window, 0 is safe */
-	return renderer->swapchainDatas[0]->format;
+	/* Copying OpenGL here. -caleb */
+	return FNA3D_SURFACEFORMAT_COLOR;
 }
 
 static FNA3D_DepthFormat D3D11_GetBackbufferDepthFormat(
@@ -4911,56 +4709,19 @@ static int32_t D3D11_QueryPixelCount(
 static uint8_t D3D11_SupportsDXT1(FNA3D_Renderer *driverData)
 {
 	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
-	uint32_t support;
-
-	ID3D11Device_CheckFormatSupport(
-		renderer->device,
-		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_DXT1],
-		&support
-	);
-
-	return (support & (
-		D3D11_FORMAT_SUPPORT_TEXTURE2D |
-		D3D11_FORMAT_SUPPORT_TEXTURE3D |
-		D3D11_FORMAT_SUPPORT_TEXTURECUBE
-	)) != 0;
+	return renderer->supportsDxt1;
 }
 
 static uint8_t D3D11_SupportsS3TC(FNA3D_Renderer *driverData)
 {
 	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
-	uint32_t support;
-
-	/* FIXME: Is there any scenario where 5 is supported and 3 isn't? */
-	ID3D11Device_CheckFormatSupport(
-		renderer->device,
-		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_DXT5],
-		&support
-	);
-
-	return (support & (
-		D3D11_FORMAT_SUPPORT_TEXTURE2D |
-		D3D11_FORMAT_SUPPORT_TEXTURE3D |
-		D3D11_FORMAT_SUPPORT_TEXTURECUBE
-	)) != 0;
+	return renderer->supportsS3tc;
 }
 
 static uint8_t D3D11_SupportsBC7(FNA3D_Renderer *driverData)
 {
 	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
-	uint32_t support;
-
-	ID3D11Device_CheckFormatSupport(
-		renderer->device,
-		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_BC7_EXT],
-		&support
-	);
-
-	return (support & (
-		D3D11_FORMAT_SUPPORT_TEXTURE2D |
-		D3D11_FORMAT_SUPPORT_TEXTURE3D |
-		D3D11_FORMAT_SUPPORT_TEXTURECUBE
-	)) != 0;
+	return renderer->supportsBc7;
 }
 
 static uint8_t D3D11_SupportsHardwareInstancing(FNA3D_Renderer *driverData)
@@ -4976,15 +4737,7 @@ static uint8_t D3D11_SupportsNoOverwrite(FNA3D_Renderer *driverData)
 static uint8_t D3D11_SupportsSRGBRenderTargets(FNA3D_Renderer *driverData)
 {
 	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
-	uint32_t support;
-
-	ID3D11Device_CheckFormatSupport(
-		renderer->device,
-		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_COLORSRGB_EXT],
-		&support
-	);
-
-	return (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) != 0;
+	return renderer->supportsSRGBRenderTarget;
 }
 
 static void D3D11_GetMaxTextureSlots(
@@ -5066,7 +4819,7 @@ static void D3D11_SetStringMarker(FNA3D_Renderer *driverData, const char *text)
 	ID3DUserDefinedAnnotation_SetMarker(renderer->annotation, wstr);
 }
 
-static const GUID GUID_D3DDebugObjectName = {0x429b8c22,0x9188,0x4b0c,{0x87, 0x42, 0xac, 0xb0, 0xbf, 0x85, 0xc2, 0x00}};
+static const GUID GUID_D3DDebugObjectName = { 0x429b8c22, 0x9188, 0x4b0c, 0x87, 0x42, 0xac, 0xb0, 0xbf, 0x85, 0xc2, 0x00 };
 
 static void D3D11_SetTextureName(FNA3D_Renderer* driverData, FNA3D_Texture* texture, const char* text)
 {
@@ -5155,18 +4908,12 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 	}
 	MOJOSHADER_d3d11DestroyContext(shaderContext);
 
-	module = SDL_LoadObject(D3D11_DLL);
+	module = D3D11_PLATFORM_LoadD3D11();
 	if (module == NULL)
 	{
 		return 0;
 	}
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) SDL_LoadFunction(
-		module,
-		"D3D11CreateDevice"
-	);
-#pragma GCC diagnostic pop
+	D3D11CreateDeviceFunc = D3D11_PLATFORM_GetCreateDeviceFunc(module);
 	if (D3D11CreateDeviceFunc == NULL)
 	{
 		SDL_UnloadObject(module);
@@ -5203,7 +4950,7 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 		);
 	}
 
-	SDL_UnloadObject(module);
+	D3D11_PLATFORM_UnloadD3D11(module);
 
 	if (FAILED(res))
 	{
@@ -5388,8 +5135,6 @@ static FNA3D_Device* D3D11_CreateDevice(
 	FNA3D_Device *result;
 	D3D11Renderer *renderer;
 	DXGI_ADAPTER_DESC1 adapterDesc;
-	typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(const GUID *riid, void **ppFactory);
-	PFN_CREATE_DXGI_FACTORY CreateDXGIFactoryFunc;
 	PFN_D3D11_CREATE_DEVICE D3D11CreateDeviceFunc;
 	D3D_FEATURE_LEVEL levels[] =
 	{
@@ -5398,9 +5143,8 @@ static FNA3D_Device* D3D11_CreateDevice(
 		D3D_FEATURE_LEVEL_10_1,
 		D3D_FEATURE_LEVEL_10_0
 	};
-	uint32_t flags;
+	uint32_t flags, supportsDxt3, supportsDxt5, supportsSrgb;
 	void* factory5;
-	void* factory6;
 	int32_t i;
 	HRESULT res;
 
@@ -5412,31 +5156,9 @@ static FNA3D_Device* D3D11_CreateDevice(
 	renderer = (D3D11Renderer*) SDL_malloc(sizeof(D3D11Renderer));
 	SDL_memset(renderer, '\0', sizeof(D3D11Renderer));
 
-	/* Load DXGI... */
-	renderer->dxgi_dll = SDL_LoadObject(DXGI_DLL);
-	if (renderer->dxgi_dll == NULL)
-	{
-		FNA3D_LogError("Could not find " DXGI_DLL);
-		return NULL;
-	}
-
-	/* Load CreateFactory... */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-	CreateDXGIFactoryFunc = (PFN_CREATE_DXGI_FACTORY) SDL_LoadFunction(
-		renderer->dxgi_dll,
-		"CreateDXGIFactory1"
-	);
-#pragma GCC diagnostic pop
-	if (CreateDXGIFactoryFunc == NULL)
-	{
-		FNA3D_LogError("Could not load function CreateDXGIFactory1!");
-		return NULL;
-	}
-
-	/* ... Create, finally. */
-	res = CreateDXGIFactoryFunc(
-		&D3D_IID_IDXGIFactory1,
+	/* Load CreateDXGIFactory1 */
+	res = D3D11_PLATFORM_CreateDXGIFactory(
+		&renderer->dxgi_dll,
 		&renderer->factory
 	);
 	ERROR_CHECK_RETURN("Could not create DXGIFactory", NULL)
@@ -5462,47 +5184,23 @@ static FNA3D_Device* D3D11_CreateDevice(
 	}
 
 	/* Select the appropriate device for rendering */
-	res = IDXGIFactory1_QueryInterface(
-		(IDXGIFactory1*) renderer->factory,
-		&D3D_IID_IDXGIFactory6,
-		(void**) &factory6
+	D3D11_PLATFORM_GetDefaultAdapter(
+		renderer->factory,
+		&renderer->adapter
 	);
-	if (SUCCEEDED(res))
-	{
-		IDXGIFactory6_EnumAdapterByGpuPreference(
-			(IDXGIFactory6*) factory6,
-			0,
-			DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-			&D3D_IID_IDXGIAdapter1,
-			(void**) &renderer->adapter
-		);
-		IDXGIFactory6_Release((IDXGIFactory6*) factory6);
-	}
-	else
-	{
-		IDXGIFactory1_EnumAdapters1(
-			(IDXGIFactory1*) renderer->factory,
-			0,
-			&renderer->adapter
-		);
-	}
 
 	IDXGIAdapter1_GetDesc1(renderer->adapter, &adapterDesc);
 
 	/* Load D3D11CreateDevice */
-	renderer->d3d11_dll = SDL_LoadObject(D3D11_DLL);
+	renderer->d3d11_dll = D3D11_PLATFORM_LoadD3D11();
 	if (renderer->d3d11_dll == NULL)
 	{
 		FNA3D_LogError("Could not find " D3D11_DLL);
 		return NULL;
 	}
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) SDL_LoadFunction(
-		renderer->d3d11_dll,
-		"D3D11CreateDevice"
+	D3D11CreateDeviceFunc = D3D11_PLATFORM_GetCreateDeviceFunc(
+		renderer->d3d11_dll
 	);
-#pragma GCC diagnostic pop
 	if (D3D11CreateDeviceFunc == NULL)
 	{
 		FNA3D_LogError("Could not load function D3D11CreateDevice!");
@@ -5581,6 +5279,37 @@ try_create_device:
 	FNA3D_LogInfo("FNA3D Driver: D3D11");
 	FNA3D_LogInfo("D3D11 Adapter: %S", adapterDesc.Description);
 
+	/* Determine DXT/S3TC support.
+	 * Note that we do NOT error check the return values!
+	 */
+	ID3D11Device_CheckFormatSupport(
+		renderer->device,
+		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_DXT1],
+		&renderer->supportsDxt1
+	);
+	ID3D11Device_CheckFormatSupport(
+		renderer->device,
+		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_DXT3],
+		&supportsDxt3
+	);
+	ID3D11Device_CheckFormatSupport(
+		renderer->device,
+		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_DXT5],
+		&supportsDxt5
+	);
+	ID3D11Device_CheckFormatSupport(
+		renderer->device,
+		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_BC7_EXT],
+		&renderer->supportsBc7
+	);
+	renderer->supportsS3tc = (supportsDxt3 || supportsDxt5);
+	ID3D11Device_CheckFormatSupport(
+		renderer->device,
+		XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_COLORSRGB_EXT],
+		&supportsSrgb
+	);
+	renderer->supportsSRGBRenderTarget = supportsSrgb;
+
 	/* Initialize MojoShader context */
 	renderer->shaderContext = MOJOSHADER_d3d11CreateContext(
 		renderer->device,
@@ -5648,6 +5377,384 @@ try_create_device:
 	ASSIGN_DRIVER(D3D11)
 	return result;
 }
+
+#ifdef __WINRT__
+
+/* WinRT Platform Implementation */
+
+static void* D3D11_PLATFORM_LoadD3D11()
+{
+	return (size_t) 69420;
+}
+
+static void D3D11_PLATFORM_UnloadD3D11(void* module)
+{
+	/* No-op */
+}
+
+static PFN_D3D11_CREATE_DEVICE D3D11_PLATFORM_GetCreateDeviceFunc(void* module)
+{
+	return D3D11CreateDevice;
+}
+
+static HRESULT D3D11_PLATFORM_CreateDXGIFactory(
+	void** module,
+	void** factory
+) {
+	return CreateDXGIFactory1(
+		&D3D_IID_IDXGIFactory2,
+		factory
+	);
+}
+
+static void D3D11_PLATFORM_UnloadDXGI(void* module)
+{
+	/* No-op */
+}
+
+static void D3D11_PLATFORM_GetDefaultAdapter(
+	void* factory,
+	IDXGIAdapter1 **adapter
+) {
+	IDXGIFactory2_EnumAdapters1(
+		(IDXGIFactory2*) factory,
+		0,
+		adapter
+	);
+}
+
+static void D3D11_PLATFORM_CreateSwapChain(
+	D3D11Renderer *renderer,
+	FNA3D_SurfaceFormat backBufferFormat,
+	void *windowHandle
+) {
+	IDXGISwapChain *swapchain;
+	D3D11SwapchainData *swapchainData;
+	DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
+	HRESULT res;
+	SDL_SysWMinfo info;
+
+	SDL_VERSION(&info.version);
+	SDL_GetWindowWMInfo((SDL_Window*) windowHandle, &info);
+
+	/* Initialize swapchain descriptor */
+	int w, h;
+	SDL_GetWindowSize((SDL_Window*) windowHandle, &w, &h);
+	swapchainDesc.Width = w;
+	swapchainDesc.Height = h;
+	swapchainDesc.Format = XNAToD3D_TextureFormat[backBufferFormat];
+	swapchainDesc.Stereo = 0;
+	swapchainDesc.SampleDesc.Count = 1;
+	swapchainDesc.SampleDesc.Quality = 0;
+	swapchainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	swapchainDesc.BufferCount = 3;
+	swapchainDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+	swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+	swapchainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+	swapchainDesc.Flags = 0;
+
+	/* Create the swap chain! */
+	res = IDXGIFactory2_CreateSwapChainForCoreWindow(
+		(IDXGIFactory2*) renderer->factory,
+		(IUnknown*) renderer->device,
+		(IUnknown*) info.info.winrt.window,
+		&swapchainDesc,
+		NULL,
+		(IDXGISwapChain1**) &swapchain
+	);
+	ERROR_CHECK("Could not create swapchain")
+
+	swapchainData = (D3D11SwapchainData*) SDL_malloc(sizeof(D3D11SwapchainData));
+	swapchainData->swapchain = swapchain;
+	swapchainData->windowHandle = windowHandle;
+	swapchainData->swapchainRTView = NULL;
+	SDL_SetWindowData((SDL_Window*) windowHandle, WINDOW_SWAPCHAIN_DATA, swapchainData);
+	if (renderer->swapchainDataCount >= renderer->swapchainDataCapacity)
+	{
+		renderer->swapchainDataCapacity *= 2;
+		renderer->swapchainDatas = SDL_realloc(
+			renderer->swapchainDatas,
+			renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*)
+		);
+	}
+	renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
+	renderer->swapchainDataCount += 1;
+}
+
+static HRESULT D3D11_PLATFORM_ResizeSwapChain(
+	D3D11Renderer *renderer,
+	D3D11SwapchainData *swapchainData
+) {
+	/* FIXME: MASSIVE XBOX REGRESSION!!!
+	 * An update to the Xbox OS went out on August 2021, and immediately
+	 * broke a ton of games including ID@Xbox titles. Some were even pulled
+	 * from the Microsoft Store!
+	 *
+	 * Reports were filed but Microsoft pretty plainly said it wasn't a
+	 * priority to fix the issue (read: breaking userspace is not a big deal
+	 * anymore?), but we found out that it's just that their latest DXGI is
+	 * broken and doesn't check the window size, instead clamping input to
+	 * be >= 8. If we trust the window size is correct we can pass those
+	 * values instead of passing (0, 0) like we're supposed to be able to.
+	 *
+	 * -flibit
+	 */
+	int w, h;
+	SDL_GetWindowSize((SDL_Window*) swapchainData->windowHandle, &w, &h);
+	return IDXGISwapChain_ResizeBuffers(
+		swapchainData->swapchain,
+		0,			/* keep # of buffers the same */
+		w,
+		h,
+		DXGI_FORMAT_UNKNOWN,	/* keep the old format */
+		0
+	);
+}
+
+#else
+
+/* Win32 Platform Implementation */
+
+static void* D3D11_PLATFORM_LoadD3D11()
+{
+	return SDL_LoadObject(D3D11_DLL);
+}
+
+static void D3D11_PLATFORM_UnloadD3D11(void* module)
+{
+	SDL_UnloadObject(module);
+}
+
+static PFN_D3D11_CREATE_DEVICE D3D11_PLATFORM_GetCreateDeviceFunc(void* module)
+{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+	return (PFN_D3D11_CREATE_DEVICE) SDL_LoadFunction(
+		module,
+		"D3D11CreateDevice"
+	);
+#pragma GCC diagnostic pop
+}
+
+static HRESULT D3D11_PLATFORM_CreateDXGIFactory(
+	void** module,
+	void** factory
+) {
+	typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(const GUID *riid, void **ppFactory);
+	PFN_CREATE_DXGI_FACTORY CreateDXGIFactoryFunc;
+
+	/* Load DXGI... */
+	*module = SDL_LoadObject(DXGI_DLL);
+	if (*module == NULL)
+	{
+		FNA3D_LogError("Could not find " DXGI_DLL);
+		return -1;
+	}
+
+	/* Load CreateFactory... */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+	CreateDXGIFactoryFunc = (PFN_CREATE_DXGI_FACTORY) SDL_LoadFunction(
+		*module,
+		"CreateDXGIFactory1"
+	);
+#pragma GCC diagnostic pop
+	if (CreateDXGIFactoryFunc == NULL)
+	{
+		FNA3D_LogError("Could not load function CreateDXGIFactory1!");
+		return -1;
+	}
+
+	/* ... Create, finally. */
+	return CreateDXGIFactoryFunc(
+		&D3D_IID_IDXGIFactory1,
+		factory
+	);
+}
+
+static void D3D11_PLATFORM_UnloadDXGI(void* module)
+{
+	SDL_UnloadObject(module);
+}
+
+static void D3D11_PLATFORM_GetDefaultAdapter(
+	void* factory,
+	IDXGIAdapter1 **adapter
+) {
+	void* factory6;
+	HRESULT res;
+	res = IDXGIFactory1_QueryInterface(
+		(IDXGIFactory1*) factory,
+		&D3D_IID_IDXGIFactory6,
+		(void**) &factory6
+	);
+	if (SUCCEEDED(res))
+	{
+		IDXGIFactory6_EnumAdapterByGpuPreference(
+			(IDXGIFactory6*) factory6,
+			0,
+			DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+			&D3D_IID_IDXGIAdapter1,
+			(void**) adapter
+		);
+		IDXGIFactory6_Release((IDXGIFactory6*) factory6);
+	}
+	else
+	{
+		IDXGIFactory1_EnumAdapters1(
+			(IDXGIFactory1*) factory,
+			0,
+			adapter
+		);
+	}
+}
+
+static void D3D11_PLATFORM_CreateSwapChain(
+	D3D11Renderer *renderer,
+	FNA3D_SurfaceFormat backBufferFormat,
+	void *windowHandle
+) {
+	IDXGIFactory1* pParent;
+	DXGI_SWAP_CHAIN_DESC swapchainDesc;
+	IDXGISwapChain *swapchain;
+	D3D11SwapchainData *swapchainData;
+	HWND dxgiHandle;
+	void* factory4;
+	HRESULT res;
+
+#ifdef FNA3D_DXVK_NATIVE
+	dxgiHandle = (HWND) windowHandle;
+#else
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	SDL_GetWindowWMInfo((SDL_Window*) windowHandle, &info);
+	dxgiHandle = info.info.win.window;
+#endif /* FNA3D_DXVK_NATIVE */
+
+	/* Initialize swapchain buffer descriptor */
+	swapchainDesc.BufferDesc.Width = 0;
+	swapchainDesc.BufferDesc.Height = 0;
+	swapchainDesc.BufferDesc.RefreshRate.Numerator = 0;
+	swapchainDesc.BufferDesc.RefreshRate.Denominator = 0;
+	swapchainDesc.BufferDesc.Format = XNAToD3D_TextureFormat[backBufferFormat];
+	swapchainDesc.BufferDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+	swapchainDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+
+	/* Initialize the swapchain descriptor */
+	swapchainDesc.SampleDesc.Count = 1;
+	swapchainDesc.SampleDesc.Quality = 0;
+	swapchainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	swapchainDesc.BufferCount = 3;
+	swapchainDesc.OutputWindow = dxgiHandle;
+	swapchainDesc.Windowed = 1;
+	if (renderer->supportsTearing)
+	{
+		/* This enum may not be complete, so use the magic number */
+		swapchainDesc.Flags = 2048; /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; */
+
+		/* To support tearing we needed DXGI 1.5, so this is always available */
+		swapchainDesc.SwapEffect = (DXGI_SWAP_EFFECT) 4; /* DXGI_SWAP_EFFECT_FLIP_DISCARD */
+	}
+	else
+	{
+		swapchainDesc.Flags = 0;
+
+		/* For Windows 10+, use a better form of discard swap behavior */
+		if (!SDL_GetHintBoolean(
+			"FNA3D_D3D11_FORCE_BITBLT",
+			SDL_FALSE
+		) && SUCCEEDED(IDXGIFactory1_QueryInterface(
+			(IDXGIFactory1*) renderer->factory,
+			&D3D_IID_IDXGIFactory4,
+			(void**) &factory4
+		))) {
+			/* This enum may not be complete, so use the magic number */
+			swapchainDesc.SwapEffect = (DXGI_SWAP_EFFECT) 4; /* DXGI_SWAP_EFFECT_FLIP_DISCARD */
+			IDXGIFactory4_Release((IDXGIFactory4*) factory4);
+		}
+		else
+		{
+			swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+		}
+	}
+
+	/* Create the swapchain! */
+	res = IDXGIFactory1_CreateSwapChain(
+		(IDXGIFactory1*) renderer->factory,
+		(IUnknown*) renderer->device,
+		&swapchainDesc,
+		&swapchain
+	);
+	ERROR_CHECK("Could not create swapchain")
+
+	/*
+	 * The swapchain's parent is a separate factory from the factory that
+	 * we used to create the swapchain, and only that parent can be used to
+	 * set the window association. Trying to set an association on our factory
+	 * will silently fail and doesn't even verify arguments or return errors.
+	 * See https://gamedev.net/forums/topic/634235-dxgidisabling-altenter/4999955/
+	 */
+	res = IDXGISwapChain_GetParent(
+		swapchain,
+		&D3D_IID_IDXGIFactory1,
+		(void**) &pParent
+	);
+	if (FAILED(res))
+	{
+		FNA3D_LogWarn(
+			"Could not get swapchain parent! Error Code: %08X",
+			res
+		);
+	}
+	else
+	{
+		/* Disable DXGI window crap */
+		res = IDXGIFactory1_MakeWindowAssociation(
+			pParent,
+			dxgiHandle,
+			DXGI_MWA_NO_WINDOW_CHANGES
+		);
+		if (FAILED(res))
+		{
+			FNA3D_LogWarn(
+				"MakeWindowAssociation failed! Error Code: %08X",
+				res
+			);
+		}
+	}
+
+	swapchainData = (D3D11SwapchainData*) SDL_malloc(sizeof(D3D11SwapchainData));
+	swapchainData->swapchain = swapchain;
+	swapchainData->windowHandle = windowHandle;
+	swapchainData->swapchainRTView = NULL;
+	SDL_SetWindowData((SDL_Window*) windowHandle, WINDOW_SWAPCHAIN_DATA, swapchainData);
+	if (renderer->swapchainDataCount >= renderer->swapchainDataCapacity)
+	{
+		renderer->swapchainDataCapacity *= 2;
+		renderer->swapchainDatas = SDL_realloc(
+			renderer->swapchainDatas,
+			renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*)
+		);
+	}
+	renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
+	renderer->swapchainDataCount += 1;
+}
+
+static HRESULT D3D11_PLATFORM_ResizeSwapChain(
+	D3D11Renderer *renderer,
+	D3D11SwapchainData *swapchainData
+) {
+	return IDXGISwapChain_ResizeBuffers(
+		swapchainData->swapchain,
+		0,			/* keep # of buffers the same */
+		0,			/* get width from window */
+		0,			/* get height from window */
+		DXGI_FORMAT_UNKNOWN,	/* keep the old format */
+		renderer->supportsTearing ? 2048 : 0 /* See CreateSwapChain */
+	);
+}
+
+#endif
 
 FNA3D_Driver D3D11Driver = {
 	"D3D11",

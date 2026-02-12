@@ -57,7 +57,12 @@
 #define DXGI_DLL	"libdxvk_dxgi.so.0"
 #endif
 
+#ifdef __WINRT__
+#include <dxgi1_2.h>
+#include <d3dcompiler.h>
+#else
 #include <dxgi.h>
+#endif
 
 #ifndef DXGI_PRESENT_ALLOW_TEARING
 #define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
@@ -1159,8 +1164,10 @@ static void D3D11_DestroyDevice(FNA3D_Device *device)
 	ID3D11Device_Release(renderer->device);
 
 	/* Release the DLLs */
+#ifndef __WINRT__
 	SDL_UnloadObject(renderer->d3d11_dll);
 	SDL_UnloadObject(renderer->dxgi_dll);
+#endif
 
 	SDL_DestroyMutex(renderer->ctxLock);
 	SDL_free(renderer);
@@ -2564,6 +2571,7 @@ static void D3D11_INTERNAL_CreateSwapChain(
 	void *windowHandle,
 	D3D11SwapchainData *swapchainData
 ) {
+#ifndef __WINRT__
 	IDXGIFactory1* pParent;
 	DXGI_SWAP_CHAIN_DESC swapchainDesc;
 	IDXGISwapChain *swapchain;
@@ -2747,6 +2755,81 @@ static void D3D11_INTERNAL_CreateSwapChain(
 		renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
 		renderer->swapchainDataCount += 1;
 	}
+#else
+	uint8_t growSwapchains = (swapchainData == NULL);
+
+	IDXGISwapChain *swapchain;
+	DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
+	HRESULT res;
+	HWND dxgiHandle;
+
+#if SDL_MAJOR_VERSION >= 3
+	dxgiHandle = (HWND) SDL_GetPointerProperty(
+		SDL_GetWindowProperties(windowHandle),
+		SDL_PROP_WINDOW_WINRT_WINDOW_POINTER,
+		NULL
+	);
+#else
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	SDL_GetWindowWMInfo((SDL_Window*) windowHandle, &info);
+	dxgiHandle = info.info.winrt.window;
+#endif
+
+	/* Initialize swapchain descriptor */
+	int w, h;
+	SDL_GetWindowSize((SDL_Window*) windowHandle, &w, &h);
+	swapchainDesc.Width = w;
+	swapchainDesc.Height = h;
+	swapchainDesc.Format = XNAToD3D_TextureFormat[backBufferFormat];
+	swapchainDesc.Stereo = 0;
+	swapchainDesc.SampleDesc.Count = 1;
+	swapchainDesc.SampleDesc.Quality = 0;
+	swapchainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	swapchainDesc.BufferCount = 3;
+	swapchainDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+	swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+	swapchainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+	swapchainDesc.Flags = 0;
+
+	/* Create the swap chain! */
+	res = IDXGIFactory2_CreateSwapChainForCoreWindow(
+		(IDXGIFactory2*) renderer->factory,
+		(IUnknown*) renderer->device,
+		(IUnknown*) dxgiHandle,
+		&swapchainDesc,
+		NULL,
+		(IDXGISwapChain1**) &swapchain
+	);
+	ERROR_CHECK("Could not create swapchain")
+
+	if (growSwapchains)
+	{
+		swapchainData = (D3D11SwapchainData*) SDL_malloc(sizeof(D3D11SwapchainData));
+	}
+	swapchainData->swapchain = swapchain;
+	swapchainData->windowHandle = windowHandle;
+	swapchainData->swapchainRTView = NULL;
+	swapchainData->format = backBufferFormat;
+#if SDL_MAJOR_VERSION >= 3
+	SDL_SetPointerProperty(SDL_GetWindowProperties(windowHandle), WINDOW_SWAPCHAIN_DATA, swapchainData);
+#else
+	SDL_SetWindowData((SDL_Window*) windowHandle, WINDOW_SWAPCHAIN_DATA, swapchainData);
+#endif
+	if (growSwapchains)
+	{
+		if (renderer->swapchainDataCount >= renderer->swapchainDataCapacity)
+		{
+			renderer->swapchainDataCapacity *= 2;
+			renderer->swapchainDatas = SDL_realloc(
+				renderer->swapchainDatas,
+				renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*)
+			);
+		}
+		renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
+		renderer->swapchainDataCount += 1;
+	}
+#endif
 }
 
 static void D3D11_INTERNAL_UpdateSwapchainRT(
@@ -2759,7 +2842,13 @@ static void D3D11_INTERNAL_UpdateSwapchainRT(
 	D3D11_RENDER_TARGET_VIEW_DESC swapchainViewDesc;
 
 	/* Create a render target view for the swapchain */
+	#ifdef __WINRT__
+	swapchainViewDesc.Format = (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+		? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+		: DXGI_FORMAT_R8G8B8A8_UNORM;
+	#else
 	swapchainViewDesc.Format = format;
+	#endif
 	swapchainViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
 	swapchainViewDesc.Texture2D.MipSlice = 0;
 
@@ -2799,6 +2888,24 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 	uint32_t support;
 
 	DXGI_FORMAT dxgiFormat = XNAToD3D_TextureFormat[parameters->backBufferFormat];
+
+	#ifdef __WINRT__
+	if (dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+	{
+		ID3D11Device_CheckFormatSupport(
+			renderer->device,
+			XNAToD3D_TextureFormat[FNA3D_SURFACEFORMAT_COLORSRGB_EXT],
+			&support
+		);
+
+		if (!support)
+		{
+			FNA3D_LogWarn("Could not create an SRGB swapchain because this renderer does not support it. Silently falling back to UNORM.");
+			parameters->backBufferFormat = FNA3D_SURFACEFORMAT_COLOR;
+			dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+		}
+	}
+	#endif
 
 	/* Dispose of the existing backbuffer in preparation for the new one. */
 	if (renderer->backbuffer != NULL)
@@ -2897,14 +3004,19 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 			}
 			else
 			{
+				int w = 0; int h = 0; int flags = renderer->supportsTearing ? 2048 : 0;
+				#ifdef __WINRT__
+				SDL_GetWindowSize((SDL_Window*) swapchainData->windowHandle, &w, &h);
+				flags = 0;
+				#endif
 				/* Resize the existing swapchain to the new window size */
 				res = IDXGISwapChain_ResizeBuffers(
 					swapchainData->swapchain,
 					0,			/* keep # of buffers the same */
-					0,			/* get width from window */
-					0,			/* get height from window */
+					w,			/* get width from window */
+					h,			/* get height from window */
 					DXGI_FORMAT_UNKNOWN,	/* keep the old format */
-					renderer->supportsTearing ? 2048 : 0 /* See INTERNAL_CreateSwapChain */
+					flags /* See INTERNAL_CreateSwapChain */
 				);
 				ERROR_CHECK_RETURN("Could not resize swapchain",)
 			}
@@ -3275,7 +3387,11 @@ static void D3D11_ReadBackbuffer(
 		ERROR_CHECK_RETURN("Could not get buffer from swapchain", )
 
 		backbufferTexture.handle = (ID3D11Resource*) swapchainBuffer;
+		#ifdef __WINRT__
+		backbufferTexture.format = FNA3D_SURFACEFORMAT_COLOR;
+		#else
 		backbufferTexture.format = renderer->swapchainDatas[0]->format;
+		#endif
 	}
 
 	D3D11_GetTextureData2D(
@@ -3311,6 +3427,9 @@ static void D3D11_GetBackbufferSize(
 static FNA3D_SurfaceFormat D3D11_GetBackbufferSurfaceFormat(
 	FNA3D_Renderer *driverData
 ) {
+#ifdef __WINRT__
+	return FNA3D_SURFACEFORMAT_COLOR;
+#else
 	D3D11Renderer *renderer = (D3D11Renderer*) driverData;
 
 	if (renderer->backbuffer->type == BACKBUFFER_TYPE_D3D11)
@@ -3320,6 +3439,7 @@ static FNA3D_SurfaceFormat D3D11_GetBackbufferSurfaceFormat(
 
 	/* This path is only possible with a single window, 0 is safe */
 	return renderer->swapchainDatas[0]->format;
+#endif
 }
 
 static FNA3D_DepthFormat D3D11_GetBackbufferDepthFormat(
@@ -5232,12 +5352,18 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 		return 0;
 	}
 	MOJOSHADER_d3d11DestroyContext(shaderContext);
-
+#ifdef __WINRT__
+	module = (size_t)69420;
+#else
 	module = SDL_LoadObject(D3D11_DLL);
+#endif
 	if (module == NULL)
 	{
 		return 0;
 	}
+#ifdef __WINRT__
+	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) D3D11CreateDevice;
+#else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) SDL_LoadFunction(
@@ -5245,9 +5371,12 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 		"D3D11CreateDevice"
 	);
 #pragma GCC diagnostic pop
+#endif
 	if (D3D11CreateDeviceFunc == NULL)
 	{
+#ifndef __WINRT__
 		SDL_UnloadObject(module);
+#endif
 		return 0;
 	}
 
@@ -5281,7 +5410,9 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 		);
 	}
 
+#ifndef __WINRT__
 	SDL_UnloadObject(module);
+#endif
 
 	if (FAILED(res))
 	{
@@ -5493,14 +5624,17 @@ static FNA3D_Device* D3D11_CreateDevice(
 	SDL_memset(renderer, '\0', sizeof(D3D11Renderer));
 
 	/* Load DXGI... */
+#ifndef __WINRT__
 	renderer->dxgi_dll = SDL_LoadObject(DXGI_DLL);
 	if (renderer->dxgi_dll == NULL)
 	{
 		FNA3D_LogError("Could not find " DXGI_DLL);
 		return NULL;
 	}
+#endif
 
 	/* Load CreateFactory... */
+#ifndef __WINRT__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 	CreateDXGIFactoryFunc = (PFN_CREATE_DXGI_FACTORY) SDL_LoadFunction(
@@ -5513,10 +5647,17 @@ static FNA3D_Device* D3D11_CreateDevice(
 		FNA3D_LogError("Could not load function CreateDXGIFactory1!");
 		return NULL;
 	}
+#else
+	CreateDXGIFactoryFunc = (PFN_CREATE_DXGI_FACTORY) CreateDXGIFactory1;
+#endif
 
 	/* ... Create, finally. */
 	res = CreateDXGIFactoryFunc(
+		#ifdef __WINRT__
+		&D3D_IID_IDXGIFactory2,
+		#else
 		&D3D_IID_IDXGIFactory1,
+		#endif
 		&renderer->factory
 	);
 	ERROR_CHECK_RETURN("Could not create DXGIFactory", NULL)
@@ -5572,12 +5713,19 @@ static FNA3D_Device* D3D11_CreateDevice(
 	IDXGIAdapter1_GetDesc1(renderer->adapter, &adapterDesc);
 
 	/* Load D3D11CreateDevice */
+#ifdef __WINRT__
+	renderer->d3d11_dll = (size_t)69420;
+#else
 	renderer->d3d11_dll = SDL_LoadObject(D3D11_DLL);
+#endif
 	if (renderer->d3d11_dll == NULL)
 	{
 		FNA3D_LogError("Could not find " D3D11_DLL);
 		return NULL;
 	}
+#ifdef __WINRT__
+	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) D3D11CreateDevice;
+#else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 	D3D11CreateDeviceFunc = (PFN_D3D11_CREATE_DEVICE) SDL_LoadFunction(
@@ -5585,6 +5733,7 @@ static FNA3D_Device* D3D11_CreateDevice(
 		"D3D11CreateDevice"
 	);
 #pragma GCC diagnostic pop
+#endif
 	if (D3D11CreateDeviceFunc == NULL)
 	{
 		FNA3D_LogError("Could not load function D3D11CreateDevice!");

@@ -1,0 +1,15 @@
+Building FNA3D for UWP
+----------------------
+FNA3D uses Visual Studio 2022 to build on Xbox One.
+
+Dependencies
+------------
+Before building, download SDL3's source code from the website:
+
+https://github.com/FNA-NET/SDL3-uwp
+
+Compiling
+---------
+1. Build SDL3-uwp/VisualC-WinRT/SDL-UWP.sln
+2. Build FNA3D.sln
+3. Grab FNA3D.dll and SDL3.dll, ship it!

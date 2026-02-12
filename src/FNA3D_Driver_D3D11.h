@@ -131,6 +131,7 @@ struct ID3DUserDefinedAnnotation
 #define ID3DUserDefinedAnnotation_GetStatus(This)	\
 	( (This)->lpVtbl -> GetStatus(This) )
 
+#ifndef __WINRT__
 /* From dxgi1_2.h */
 
 typedef enum DXGI_ALPHA_MODE {
@@ -181,6 +182,8 @@ typedef struct DXGI_MATRIX_3X2_F {
 	float _31;
 	float _32;
 } DXGI_MATRIX_3X2_F;
+
+#endif
 
 /* From dxgi1_4.h, cleaned up a bit... */
 
@@ -340,6 +343,7 @@ struct IDXGIFactory4
 #define IDXGIFactory4_Release(This)	\
 	( (This)->lpVtbl -> Release(This) )
 
+#ifndef __WINRT__
 /* IDXGISwapChain3 */
 
 typedef struct IDXGISwapChain3 IDXGISwapChain3;
@@ -544,6 +548,8 @@ struct IDXGISwapChain3
 
 #define IDXGISwapChain3_SetColorSpace1(This, colour_space)	\
 	( (This)->lpVtbl -> SetColorSpace1(This, colour_space) )
+
+#endif
 
 /* IDXGIFactory5 */
 /* From dxgi1_5.h, cleaned up a bit... */
